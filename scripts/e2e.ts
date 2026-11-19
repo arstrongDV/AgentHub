@@ -17,12 +17,21 @@ const ok = (cond: any, msg: string) => {
   passed++; console.log(`  ✓ ${msg}`);
 };
 
-// ---- fake GitHub API (PR files for conflict detection) ----
+// ---- fake GitHub API (PR files for conflict detection, PR list + CI for polling sync) ----
 const prFiles: Record<string, string[]> = {};
+const pulls: Record<string, any> = {};
+const checkRuns: Record<string, any[]> = {};
 const gh = http.createServer((req, res) => {
-  const m = /\/repos\/.+\/pulls\/(\d+)\/files/.exec(req.url || "");
-  res.setHeader("content-type", "application/json");
-  res.end(JSON.stringify((prFiles[m?.[1] || ""] || []).map((filename) => ({ filename }))));
+  const url = req.url || "";
+  const send = (body: any, status = 200) => { res.statusCode = status; res.setHeader("content-type", "application/json"); res.end(JSON.stringify(body)); };
+  if (url.startsWith("/repos/acme/private/")) return send({ message: "Not Found" }, 404);
+  let m = /\/repos\/.+\/pulls\/(\d+)\/files/.exec(url);
+  if (m) return send((prFiles[m[1]] || []).map((filename) => ({ filename })));
+  if (/\/repos\/[^/]+\/[^/]+\/pulls\?/.test(url)) return send(Object.values(pulls));
+  if ((m = /\/repos\/.+\/pulls\/(\d+)$/.exec(url))) return pulls[m[1]] ? send(pulls[m[1]]) : send({ message: "Not Found" }, 404);
+  if ((m = /\/commits\/([^/]+)\/check-runs/.exec(url))) return send({ total_count: (checkRuns[m[1]] || []).length, check_runs: checkRuns[m[1]] || [] });
+  if (/\/commits\/[^/]+\/status$/.test(url)) return send({ state: "pending", total_count: 0, statuses: [] });
+  send([]);
 }).listen(GH_PORT);
 
 const dbFile = path.join(os.tmpdir(), `ar-e2e-${Date.now()}.db`);
@@ -230,6 +239,23 @@ async function main() {
   ok((await alice("GET", `${R}/tasks`)).data.find((t: any) => t.number === n1).status === "done", "PR merged → task done");
   ok(evA.events.some((e) => e.type === "wake" && /unblocked/.test(e.reason)), "frontend woken: its task is unblocked");
   ok(!(await A.call("claim_task", { number: num("fe-1") })).error, "frontend can now claim fe-1");
+
+  // Polling sync (no webhook for this PR): the agent links it, it gets merged on GitHub, its tests fail.
+  const n2 = num("be-2");
+  pulls["9"] = { number: 9, title: "Listings API", html_url: "https://github.com/acme/foodshare/pull/9", state: "closed", merged_at: new Date().toISOString(),
+    draft: false, head: { ref: "feature/listings", sha: "sha9" }, user: { login: "bob" }, body: "", created_at: new Date().toISOString() };
+  checkRuns["sha9"] = [{ name: "unit", status: "completed", conclusion: "success" }, { name: "e2e", status: "completed", conclusion: "failure", output: { title: "2 tests failed" } }];
+  await B.call("link_pr", { number: n2, url: "https://github.com/acme/foodshare/pull/9" });
+  let p9: any;
+  for (let i = 0; i < 30 && p9?.state !== "merged"; i++) { await sleep(100); p9 = (await alice("GET", `${R}/prs`)).data.find((p: any) => p.number === 9); }
+  ok(p9.state === "merged" && p9.title === "Listings API" && p9.author === "bob", "polling sync: linked PR gets its real state from the GitHub API");
+  ok(p9.ci_state === "failing" && p9.feedback.some((f: any) => f.body.includes("2 tests failed")), "polling sync: failing check runs → CI failing + feedback");
+  ok((await alice("GET", `${R}/tasks`)).data.find((t: any) => t.number === n2).status === "done", "polling sync: merged PR marks the task done");
+  await alice("POST", `${R}/repos`, { fullName: "acme/private" });
+  await alice("POST", `${R}/prs/sync`);
+  const repos = (await alice("GET", R)).data.repos;
+  ok(repos.find((r: any) => r.full_name === "acme/private").sync_error === "not_found" && repos.find((r: any) => r.full_name === "acme/foodshare").webhook_at,
+    "sync status per repo: unreadable repo reported, webhook deliveries tracked");
 
   console.log("Phase 5: plan changes, pause, revoke");
   const chg = await B.call("propose_plan_change", { title: "Add rate limiting", rationale: "Human asked", new_tasks: [{ key: "be-3", title: "Rate limit API", depends_on: [`#${n1}`] }] });

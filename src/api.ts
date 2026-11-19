@@ -146,7 +146,8 @@ export function apiRoutes(app: Express) {
   }));
 
   // ----- repos & PRs -----
-  room.get("/prs", h((req) => G.prsOf(req.params.roomId)));
+  room.get("/prs", h((req) => { void G.syncRoomPrs(req.params.roomId, "view"); return G.prsOf(req.params.roomId); }));
+  room.post("/prs/sync", h(async (req) => { await G.syncRoomPrs(req.params.roomId, "force"); return G.prsOf(req.params.roomId); }));
   room.post("/repos", requireOwner, h((req) => {
     const out = G.addRepo(req.params.roomId, human(req), req.body?.fullName, req.body?.apiToken, req.body?.defaultBranch);
     return { ...out, webhookUrl: `${publicUrl(req)}/api/github/webhook/${out.id}` };
