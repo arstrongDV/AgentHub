@@ -402,7 +402,7 @@ function TaskModal({ id, m, t, all, onClose }) {
       <select style="width:auto" value=${t.status} onChange=${(e) => patch({ status: e.target.value })}>${Object.entries(STATUS).map(([k, v]) => html`<option value=${k}>${v}</option>`)}</select>
       <select style="width:auto" value=${t.owner || ""} onChange=${(e) => patch({ owner: e.target.value })}><option value="">— не призначено —</option>${m.agents.map((a) => html`<option value=${a.name}>${a.name}</option>`)}</select>
       ${t.milestone && html`<span class="badge">${t.milestone.title}</span>`}${t.plan_key && html`<code>${t.plan_key}</code>`}
-      ${t.pr && html`<a href=${t.pr.url} target="_blank" rel="noopener">PR #${t.pr.number} · ${t.pr.state}${t.pr.ci_state ? ` · CI ${t.pr.ci_state}` : ""}</a>`}
+      ${t.pr && html`<a href=${t.pr.url} target="_blank" rel="noopener">PR #${t.pr.number} · ${PR_STATE[t.pr.state]?.[1] || t.pr.state}${CI_STATE[t.pr.ci_state] ? ` · ${CI_STATE[t.pr.ci_state][1]}` : ""}</a>`}
     </div>
     ${t.description && html`<div style="white-space:pre-wrap">${t.description}</div>`}
     ${t.acceptance && html`<div class="card" style="margin-top:10px;padding:10px 12px"><b class="small">Критерії готовності</b><div style="white-space:pre-wrap">${t.acceptance}</div></div>`}
@@ -536,15 +536,56 @@ function Activity({ id, tick }) {
     ${(a.data || []).map((x) => html`<div class="act"><span class="time">${new Date(x.created_at).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}</span><span>${x.summary}</span></div>`)}</div>`;
 }
 
-function PRs({ id, m, tick }) {
+const PR_STATE = { open: ["●", "Відкритий"], draft: ["◌", "Чернетка"], merged: ["✓", "Merged"], closed: ["✕", "Закрито без merge"] };
+const CI_STATE = { passing: ["✓", "тести пройшли"], failing: ["✗", "тести впали"], pending: ["⏳", "тести йдуть"] };
+const prTone = (p) => (p.ci_state === "failing" ? "bad" : p.state === "merged" ? "good" : p.state === "closed" ? "closed" : "open");
+const isOpenPr = (p) => p.state === "open" || p.state === "draft";
+
+// How fresh the PR data is, per repo, and what to do when GitHub can't be read.
+function RepoSync({ r, id, owner }) {
+  const fix = owner ? html` <${Link} href=${`/r/${id}/settings`}>Налаштування → Репозиторії</${Link}>.` : " Попроси власника кімнати.";
+  const err = {
+    not_found: html`GitHub не бачить <b>${r.full_name}</b>: репозиторій приватний або назва з помилкою. Додай токен з доступом до нього —${fix}`,
+    unauthorized: html`GitHub відхилив токен для <b>${r.full_name}</b> (недійсний або прострочений). Онови його —${fix}`,
+    rate_limit: html`Вичерпано ліміт запитів до GitHub${r.has_token ? "" : " (без токена — 60 на годину)"}. Наступна спроба ${r.sync_retry_at ? `о ${time(r.sync_retry_at)}` : "згодом"}.${r.has_token ? "" : html` З токеном ліміт 5000/год —${fix}`}`,
+    network: html`Не вдалося з'єднатися з GitHub${r.sync_detail ? ` (${r.sync_detail})` : ""}. Перевір інтернет і натисни «Оновити з GitHub».`,
+    http: html`GitHub відповів помилкою ${r.sync_detail} для <b>${r.full_name}</b>.`,
+  }[r.sync_error];
+  if (err) return html`<div class="callout pr-err">${err}</div>`;
+  const how = r.webhook_at ? "вебхуки працюють" : `вебхуків немає — хаб сам перевіряє GitHub кожні ${r.has_token ? "1" : "5"} хв, поки є відкриті PR`;
+  return html`<div class="muted small pr-sync"><b>${r.full_name}</b> · ${r.synced_at ? `оновлено з GitHub ${ago(r.synced_at)}` : "ще не перевірено"} · ${how}</div>`;
+}
+
+function PrCard({ p, id }) {
+  const [icon, label] = PR_STATE[p.state] || ["", p.state];
+  const ci = CI_STATE[p.ci_state];
+  return html`<div class=${`lentry pr ${prTone(p)}`}><div class="row wrap"><span class=${`prstate ${p.state}`}>${icon} ${label}</span>
+      <a href=${p.url} target="_blank" rel="noopener"><b>#${p.number} ${p.title}</b></a>
+      ${ci && html`<span class=${`prci ${p.ci_state}`}>${ci[0]} ${ci[1]}</span>`}<span class="spacer"></span><span class="muted small">${p.repo}${p.branch ? ` · ${p.branch}` : ""}</span></div>
+    <div class="foot">${p.task_number ? html`<${Link} href=${`/r/${id}/tasks?t=${p.task_number}`}>задача #${p.task_number} ${p.task_title}</${Link}>` : html`<span style="color:var(--amber)">не прив'язано до задачі</span>`}${p.author && html`<span>${p.author}</span>`}<span>${ago(p.updated_at)}</span></div>
+    ${p.feedback.length > 0 && html`<div style="margin-top:8px">${p.feedback.slice(0, 4).map((f) => html`<div class="note"><span class="badge">${f.kind === "ci" ? "CI" : f.kind}</span> <b>${f.author}</b>${f.path ? html` <code>${f.path}</code>` : ""}<div>${f.body}</div></div>`)}</div>`}</div>`;
+}
+
+function PRs({ id, m, tick, refresh }) {
   const prs = useData(`/api/rooms/${id}/prs`, [tick]);
-  return html`<div style="max-width:1000px"><div class="page-h"><h2>Pull requests</h2></div>
+  const [busy, setBusy] = useState(false);
+  const sync = async () => {
+    setBusy(true);
+    try { await api(`/api/rooms/${id}/prs/sync`, { method: "POST" }); refresh(); } catch (e) { toast(e.message); } finally { setBusy(false); }
+  };
+  const list = prs.data || [];
+  const open = list.filter(isOpenPr), closed = list.filter((p) => !isOpenPr(p));
+  const failing = list.filter((p) => p.ci_state === "failing").length;
+  // The keys remount blocks whose content changed: Chrome page translation freezes in-place text updates.
+  return html`<div style="max-width:1000px"><div class="page-h"><h2>Pull requests</h2><span class="spacer"></span>
+      ${m.repos.length > 0 && html`<button class="sm" key=${busy ? "busy" : "idle"} disabled=${busy} onClick=${sync}>${busy ? "Перевіряю…" : "↻ Оновити з GitHub"}</button>`}</div>
     ${!m.repos.length && html`<div class="callout">Підключи репозиторій у <${Link} href=${`/r/${id}/settings`}>Налаштуваннях</${Link}> — тоді PR автоматично прив'язуються до задач, а агенти отримують рев'ю й результати CI.</div>`}
-    ${(prs.data || []).map((p) => html`<div class="lentry"><div class="row wrap"><span class=${`badge ${p.state}`}>${p.state}</span><a href=${p.url} target="_blank" rel="noopener"><b>#${p.number} ${p.title}</b></a>
-        ${p.ci_state && html`<span class=${`badge ${p.ci_state}`}>CI ${p.ci_state}</span>`}<span class="spacer"></span><span class="muted small">${p.repo} · ${p.branch}</span></div>
-      <div class="foot">${p.task_number ? html`<${Link} href=${`/r/${id}/tasks?t=${p.task_number}`}>задача #${p.task_number} ${p.task_title}</${Link}>` : html`<span style="color:var(--amber)">не прив'язано до задачі</span>`}<span>${p.author || ""}</span><span>${ago(p.updated_at)}</span></div>
-      ${p.feedback.length > 0 && html`<div style="margin-top:8px">${p.feedback.slice(0, 4).map((f) => html`<div class="note"><span class="badge">${f.kind}</span> <b>${f.author}</b>${f.path ? html` <code>${f.path}</code>` : ""}<div>${f.body}</div></div>`)}</div>`}</div>`)}
-    ${m.repos.length > 0 && !(prs.data || []).length && html`<div class="empty">PR ще немає. Агенти відкривають їх з гілок <code>${"room/<номер>-slug"}</code>.</div>`}</div>`;
+    ${m.repos.map((r) => html`<${RepoSync} key=${`${r.id}:${r.sync_error}:${r.synced_at}:${r.webhook_at}`} r=${r} id=${id} owner=${m.me.role === "owner"} />`)}
+    ${list.length > 0 && html`<div class="pr-sum" key=${`${open.length}:${list.length}:${failing}`}><span><b>${open.length}</b> відкритих</span><span class="good"><b>${list.filter((p) => p.state === "merged").length}</b> merged</span>
+      ${failing > 0 && html`<span class="bad"><b>${failing}</b> з упалими тестами</span>`}</div>`}
+    ${open.length > 0 && html`<h3 class="pr-h" key=${`o${open.length}`}>Відкриті · ${open.length}</h3>${open.map((p) => html`<${PrCard} key=${`${p.id}:${p.state}:${p.ci_state}:${p.updated_at}`} p=${p} id=${id} />`)}`}
+    ${closed.length > 0 && html`<h3 class="pr-h" key=${`c${closed.length}`}>Завершені · ${closed.length}</h3>${closed.map((p) => html`<${PrCard} key=${`${p.id}:${p.state}:${p.ci_state}:${p.updated_at}`} p=${p} id=${id} />`)}`}
+    ${m.repos.length > 0 && !list.length && html`<div class="empty">PR ще немає. Агенти відкривають їх з гілок <code>${"room/<номер>-slug"}</code>.</div>`}</div>`;
 }
 
 // ====================== SETTINGS ======================
@@ -553,6 +594,12 @@ function Settings({ id, m, refresh }) {
   const [invite, setInvite] = useState(null);
   const [repo, setRepo] = useState({ fullName: "", apiToken: "" });
   const [newRepo, setNewRepo] = useState(null);
+  const [tokenFor, setTokenFor] = useState(null); // repo id whose token is being edited
+  const [tokenVal, setTokenVal] = useState("");
+  const saveToken = tryToast(async (repoId, value) => {
+    await api(`/api/rooms/${id}/repos/${repoId}`, { method: "PATCH", body: { apiToken: value } });
+    setTokenFor(null); setTokenVal(""); toast(value ? "Токен збережено, перевіряю GitHub…" : "Токен прибрано");
+  });
   const [setup, setSetup] = useState(null);
   const [editing, setEditing] = useState(null);
   const [creating, setCreating] = useState(false);
@@ -578,10 +625,17 @@ function Settings({ id, m, refresh }) {
     <div class="card"><h3>Репозиторії GitHub</h3>
       ${m.repos.map((r) => html`<div class="row" style="padding:6px 0;border-bottom:1px solid var(--line)"><b>${r.full_name}</b><span class="muted small">${r.default_branch}</span>
         ${r.has_token ? html`<span class="badge done">token</span>` : html`<span class="badge" title="Без токена не працює детектор конфліктів між PR">без токена</span>`}<span class="spacer"></span>
-        ${owner && html`<button class="ghost sm" onClick=${() => setNewRepo({ ...r, secret: r.webhook_secret, webhookUrl: `${m.hubUrl}/api/github/webhook/${r.id}` })}>Webhook</button>
-        <button class="ghost sm danger" onClick=${tryToast(async () => { if (confirm("Від'єднати репозиторій?")) await api(`/api/rooms/${id}/repos/${r.id}`, { method: "DELETE" }); })}>✕</button>`}</div>`)}
+        ${owner && html`<button class="ghost sm" onClick=${() => { setTokenFor(tokenFor === r.id ? null : r.id); setTokenVal(""); }}>Токен</button>
+        <button class="ghost sm" onClick=${() => setNewRepo({ ...r, secret: r.webhook_secret, webhookUrl: `${m.hubUrl}/api/github/webhook/${r.id}` })}>Webhook</button>
+        <button class="ghost sm danger" onClick=${tryToast(async () => { if (confirm("Від'єднати репозиторій?")) await api(`/api/rooms/${id}/repos/${r.id}`, { method: "DELETE" }); })}>✕</button>`}</div>
+        ${tokenFor === r.id && html`<div class="row wrap" style="padding:8px 0 10px;border-bottom:1px solid var(--line)">
+          <input type="password" style="flex:1;min-width:220px" placeholder=${r.has_token ? "новий токен github_pat_…" : "github_pat_…"} value=${tokenVal} onInput=${(e) => setTokenVal(e.target.value)} />
+          <button class="primary sm" disabled=${!tokenVal.trim()} onClick=${() => saveToken(r.id, tokenVal.trim())}>Зберегти</button>
+          ${r.has_token && html`<button class="ghost sm danger" onClick=${() => saveToken(r.id, "")}>Прибрати токен</button>`}
+          <button class="ghost sm" onClick=${() => setTokenFor(null)}>Скасувати</button></div>`}`)}
+      <p class="small muted" style="margin:10px 0 0">Хаб сам читає з GitHub стан PR і результати CI. Для публічного репозиторію токен не потрібен (ліміт GitHub — 60 запитів/год). Токен потрібен для приватного репо, детектора конфліктів між PR і частішого оновлення: fine-grained з read-only доступом до цього репо (Pull requests, Commit statuses, Checks) або classic зі scope <code>repo</code>.</p>
       ${owner ? html`<div class="grid2" style="margin-top:6px"><div><label class="f">Репозиторій</label><input placeholder="owner/name" value=${repo.fullName} onInput=${(e) => setRepo({ ...repo, fullName: e.target.value })} /></div>
-        <div><label class="f">Token (необов'язково, read-only: Pull requests)</label><input type="password" placeholder="github_pat_…" value=${repo.apiToken} onInput=${(e) => setRepo({ ...repo, apiToken: e.target.value })} /></div></div>
+        <div><label class="f">Token (необов'язково для публічного репо)</label><input type="password" placeholder="github_pat_…" value=${repo.apiToken} onInput=${(e) => setRepo({ ...repo, apiToken: e.target.value })} /></div></div>
         <div class="row" style="margin-top:10px"><button class="primary" onClick=${addRepo}>Підключити</button></div>` : html`<p class="muted small">Підключає репозиторії власник кімнати.</p>`}
       ${newRepo && html`<div style="margin-top:14px"><b>Налаштуй webhook у GitHub</b>
         <p class="small muted">GitHub → ${newRepo.fullName || newRepo.full_name} → Settings → Webhooks → Add webhook. Content type: <code>application/json</code>. Events: «Let me select» → Pull requests, Pull request reviews, Pull request review comments, Issue comments, Check suites, Check runs, Statuses.</p>

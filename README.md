@@ -153,10 +153,18 @@ URL зміниться після перезапуску тунелю, і аге
 
 ## Підключення GitHub-репозиторію
 
-1. Налаштування → «Репозиторії GitHub» → `owner/name` (+ необов'язковий fine-grained token з правом
-   **Pull requests: Read**; потрібен для детектора конфліктів між PR).
-2. У GitHub: Settings → Webhooks → Add webhook. Payload URL і Secret бере з інтерфейсу, тип вмісту `application/json`.
-   Події: Pull requests, Pull request reviews, Pull request review comments, Issue comments, Check suites, Check runs, Statuses.
+1. Налаштування → «Репозиторії GitHub» → `owner/name`. Для публічного репозиторію цього досить.
+   Токен (кнопка «Токен», можна додати будь-коли) потрібен для приватного репо, детектора конфліктів між PR
+   і частішого оновлення: fine-grained з read-only Pull requests, Commit statuses, Checks або classic зі scope `repo`.
+2. Необов'язково, якщо хаб доступний з інтернету: у GitHub Settings → Webhooks → Add webhook. Payload URL і Secret
+   бере з інтерфейсу, тип вмісту `application/json`. Події: Pull requests, Pull request reviews,
+   Pull request review comments, Issue comments, Check suites, Check runs, Statuses.
+
+**Без вебхуків (хаб на `localhost`)** хаб сам читає з GitHub API стан PR (open / draft / merged / closed) і результати
+CI (check runs + commit statuses): у фоні, поки є відкриті PR або задачі в роботі (з токеном раз на хвилину,
+без токена раз на 5 хв, бо ліміт GitHub — 60 запитів/год), при відкритті вкладки «PR» і по кнопці «Оновити з GitHub».
+Наслідки ті самі, що й від вебхуків: merge → задача `done`, падіння CI → повідомлення агенту. Рев'ю й коментарі
+приходять лише вебхуками. Вкладка «PR»: зелена картка — змерджено, червона — тести впали, сіра — закрито без merge.
 
 Що відбувається далі:
 - PR прив'язується до задачі за назвою гілки `room/<n>-…` або рядком `Task: #<n>` в описі.

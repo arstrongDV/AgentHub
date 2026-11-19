@@ -7,7 +7,7 @@ import "./db.js";
 import { loadUser, authRoutes, GITHUB_ENABLED } from "./auth.js";
 import { apiRoutes } from "./api.js";
 import * as C from "./core.js";
-import { handleWebhook } from "./github.js";
+import { handleWebhook, startPrSync } from "./github.js";
 import { buildMcpServer } from "./mcp.js";
 import { pointerFile, cursorPointer } from "./templates.js";
 
@@ -123,6 +123,7 @@ app.use(express.static(path.join(root, "public"), { index: false }));
 app.get(/^\/(?!api\/|mcp\/|auth\/).*/, (_req, res) => res.sendFile(path.join(root, "public/index.html")));
 
 app.listen(PORT, () => {
+  startPrSync();
   console.log(`agent-rooms v2 on http://localhost:${PORT}`);
   console.log(`login: local accounts${GITHUB_ENABLED ? " + GitHub OAuth" : " (set GITHUB_CLIENT_ID/SECRET to enable GitHub login)"}`);
 });
