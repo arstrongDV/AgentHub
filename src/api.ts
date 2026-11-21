@@ -5,6 +5,7 @@ import { requireUser, requireMember, requireOwner, csrf, publicUrl } from "./aut
 import * as C from "./core.js";
 import * as P from "./planning.js";
 import * as G from "./github.js";
+import * as F from "./files.js";
 import { pointerFile, cursorPointer } from "./templates.js";
 
 const human = (req: Request<any>): C.Actor => ({ kind: "human", name: req.user!.display_name, userId: req.user!.id });
@@ -98,7 +99,16 @@ export function apiRoutes(app: Express) {
 
   // ----- docs -----
   room.get("/docs", h((req) => C.listDocs(req.params.roomId)));
-  room.get("/doc", h((req) => C.getDoc(req.params.roomId, C.normDocPath(String(req.query.path))) || C.fail("not found", 404)));
+  room.get("/doc", h((req) => {
+    const d = C.getDoc(req.params.roomId, C.normDocPath(String(req.query.path))) || C.fail("not found", 404);
+    return { ...d, file: F.fileMeta(d.id, d.version) || null };
+  }));
+  // PDF upload: raw bytes in the body (not JSON), path and original file name in the query.
+  room.put("/doc/file", express.raw({ type: () => true, limit: F.MAX_PDF_BYTES }), h((req) =>
+    F.uploadPdf(req.params.roomId, String(req.query.path || ""), Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0),
+      String(req.query.name || ""), human(req), req.member!.role)));
+  room.get("/doc/file", h((req, res) =>
+    F.sendDocFile(res, req.params.roomId, String(req.query.path), Number(req.query.v) || undefined, req.query.download === "1")));
   room.put("/doc", h((req) => C.writeDoc(req.params.roomId, req.body?.path, req.body?.content, human(req), { memberRole: req.member!.role, baseVersion: req.body?.baseVersion })));
   room.delete("/doc", h((req) => C.deleteDoc(req.params.roomId, String(req.query.path), human(req), req.member!.role)));
   room.get("/doc/versions", h((req) => C.docVersions(req.params.roomId, C.normDocPath(String(req.query.path)))));

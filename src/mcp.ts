@@ -4,11 +4,14 @@ import { z } from "zod";
 import * as C from "./core.js";
 import * as P from "./planning.js";
 import * as G from "./github.js";
+import * as F from "./files.js";
 import { buildContext, myTasksBlock } from "./context.js";
 
 type A = C.Agent;
 
-export function buildMcpServer(agent: A) {
+const READ_CHUNK = 40000; // keeps one read_doc result well under clients' tool-output limits
+
+export function buildMcpServer(agent: A, hubUrl: string) {
   const roomId = agent.room_id;
   const me: C.Actor = C.agentActor(agent);
   const room = C.getRoom(roomId)!;
@@ -57,14 +60,25 @@ export function buildMcpServer(agent: A) {
     { full: z.boolean().optional().describe("Force the full context instead of changes only") },
     ({ full }, a) => buildContext(a, { full }));
 
-  tool("list_docs", "List all documents in the room knowledge base (team docs, agent profiles, generated docs).", {},
-    () => C.listDocs(roomId).map((d) => `${d.path}  v${d.version}  ${d.size} chars  by ${d.updated_by}`).join("\n"));
+  tool("list_docs", "List all documents in the room knowledge base (team docs, agent profiles, generated docs). PDF uploads are listed with their page count; read_doc returns their extracted text.", {},
+    () => C.listDocs(roomId).map((d) => `${d.path}  v${d.version}  ${d.size} chars${d.pdf_pages != null ? `  (PDF, ${d.pdf_pages} pages)` : ""}  by ${d.updated_by}`).join("\n"));
 
-  tool("read_doc", "Read a knowledge-base document by path, e.g. /team/requirements.md, /agents/<name>/profile.md, /generated/api-contract.md.",
-    { path: z.string() },
-    ({ path }) => {
+  tool("read_doc", "Read a knowledge-base document by path, e.g. /team/requirements.md, /team/architecture.pdf, /agents/<name>/profile.md, /generated/api-contract.md. For an uploaded PDF it returns the extracted text plus a download link for the original (with images and diagrams). Long docs come in chunks: pass offset to continue.",
+    { path: z.string(), offset: z.number().int().min(0).optional().describe("Character offset to continue a long document from") },
+    ({ path, offset = 0 }) => {
       const d = C.getDoc(roomId, C.normDocPath(path)) || C.fail(`not found: ${path}. Use list_docs.`);
-      return `# ${d.path} (v${d.version}, by ${d.updated_by})\n\n${d.content}`;
+      const out = [`# ${d.path} (v${d.version}, by ${d.updated_by})`];
+      const f = F.fileMeta(d.id, d.version);
+      if (f) {
+        const file = `/tmp/${f.name.replace(/[^\w.-]+/g, "_")}`;
+        out.push(`Original PDF "${f.name}" (${f.pages} pages, ${Math.ceil(f.size / 1024)} KB), with images and diagrams. Download link, valid for 1 hour:`,
+          F.signedFileLink(hubUrl, f),
+          `e.g. curl -fsSL "<link>" -o ${file}  then open ${file} with your file-reading tool (Claude Code's Read tool shows PDF pages, diagrams included).`);
+      }
+      const end = Math.min(d.content.length, offset + READ_CHUNK);
+      out.push("", d.content.slice(offset, end));
+      if (end < d.content.length) out.push("", `…(showing characters ${offset}–${end} of ${d.content.length}: call read_doc with offset=${end} for the rest)`);
+      return out.join("\n");
     });
 
   tool("write_doc",

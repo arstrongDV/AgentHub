@@ -5,15 +5,39 @@ export const html = htm.bind(h);
 export { h, render, useState, useEffect, useRef, useCallback };
 
 export async function api(path, { method = "GET", body } = {}) {
-  const res = await fetch(path, {
+  return result(await fetch(path, {
     method,
     headers: { "content-type": "application/json", "x-requested-with": "agent-rooms" },
     body: body !== undefined ? JSON.stringify(body) : undefined,
-  });
+  }));
+}
+// Sends a File as the raw request body (e.g. a PDF upload).
+export async function apiUpload(path, file) {
+  return result(await fetch(path, {
+    method: "PUT",
+    headers: { "content-type": file.type || "application/octet-stream", "x-requested-with": "agent-rooms" },
+    body: file,
+  }));
+}
+async function result(res) {
   const ct = res.headers.get("content-type") || "";
   const data = ct.includes("json") ? await res.json() : await res.text();
-  if (!res.ok) throw new Error((data && data.error) || res.statusText);
+  if (!res.ok) throw new Error((data && data.error) || (res.status === 413 ? "файл завеликий" : res.statusText));
   return data;
+}
+
+// Doc paths allow only latin letters, digits, - _ . — so "Вимоги до проєкту.pdf" becomes "Vymohy-do-proiektu.pdf".
+const TRANSLIT = { а: "a", б: "b", в: "v", г: "h", ґ: "g", д: "d", е: "e", є: "ie", ж: "zh", з: "z", и: "y", і: "i", ї: "i", й: "i",
+  к: "k", л: "l", м: "m", н: "n", о: "o", п: "p", р: "r", с: "s", т: "t", у: "u", ф: "f", х: "kh", ц: "ts", ч: "ch", ш: "sh",
+  щ: "shch", ь: "", ю: "iu", я: "ia", ы: "y", э: "e", ъ: "", ё: "e", "'": "", "’": "", "ʼ": "" };
+export function fileSlug(name) {
+  const dot = name.lastIndexOf(".");
+  const ext = dot > 0 ? name.slice(dot + 1).toLowerCase().replace(/[^a-z0-9]/g, "") : "";
+  const base = (dot > 0 ? name.slice(0, dot) : name).split("").map((c) => {
+    const t = TRANSLIT[c.toLowerCase()];
+    return t === undefined ? c : c === c.toLowerCase() ? t : t.charAt(0).toUpperCase() + t.slice(1);
+  }).join("").normalize("NFKD").replace(/[\u0300-\u036f]/g, "").replace(/[^\w.-]+/g, "-").replace(/-{2,}/g, "-").replace(/^[-.]+|[-.]+$/g, "");
+  return (base || "document").slice(0, 120) + (ext ? `.${ext}` : "");
 }
 
 let toastTimer;
