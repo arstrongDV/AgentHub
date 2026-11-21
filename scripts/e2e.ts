@@ -43,15 +43,19 @@ const cleanup = () => { srv.kill(); gh.close(); for (const f of [dbFile, dbFile 
 // ---- tiny HTTP client with cookies ----
 function client() {
   let cookie = "";
+  // A Buffer body is sent raw as a PDF (uploads); anything else as JSON.
   return async (method: string, p: string, body?: any) => {
+    const raw = Buffer.isBuffer(body);
     const res = await fetch(H + p, {
-      method, headers: { "content-type": "application/json", "x-requested-with": "agent-rooms", cookie }, body: body ? JSON.stringify(body) : undefined,
+      method, headers: { "content-type": raw ? "application/pdf" : "application/json", "x-requested-with": "agent-rooms", cookie },
+      body: raw ? new Uint8Array(body) : body ? JSON.stringify(body) : undefined,
     });
     const sc = res.headers.get("set-cookie");
     if (sc) cookie = sc.split(";")[0];
-    const text = await res.text();
+    const buf = Buffer.from(await res.arrayBuffer());
+    const text = buf.toString();
     let data: any = text; try { data = JSON.parse(text); } catch {}
-    return { status: res.status, data };
+    return { status: res.status, data, buf, headers: res.headers };
   };
 }
 async function mcp(token: string) {
@@ -82,6 +86,23 @@ function agentEvents(token: string) {
   return { events, stop: () => ctrl.abort() };
 }
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+// Minimal one-page PDF with real text (Helvetica), xref offsets computed so pdf.js parses it cleanly.
+function makePdf(lines: string[]) {
+  const stream = `BT /F1 12 Tf 72 720 Td 16 TL ${lines.map((l) => `(${l.replace(/[()\\]/g, "\\$&")}) '`).join(" ")} ET`;
+  const objs = [
+    "<< /Type /Catalog /Pages 2 0 R >>",
+    "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>",
+    `<< /Length ${stream.length} >>\nstream\n${stream}\nendstream`,
+    "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+  ];
+  let out = "%PDF-1.4\n";
+  const offsets = objs.map((o, i) => { const at = out.length; out += `${i + 1} 0 obj\n${o}\nendobj\n`; return at; });
+  const xref = out.length;
+  out += `xref\n0 ${objs.length + 1}\n0000000000 65535 f \n${offsets.map((o) => `${String(o).padStart(10, "0")} 00000 n \n`).join("")}`;
+  out += `trailer\n<< /Size ${objs.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
+  return Buffer.from(out, "latin1");
+}
 function sign(secret: string, body: string) { return "sha256=" + crypto.createHmac("sha256", secret).update(body).digest("hex"); }
 
 async function main() {
@@ -136,6 +157,40 @@ async function main() {
   ok(ctx.text.includes("What changed") && !ctx.text.includes("### /team/workflow.md"), "second get_context returns delta only");
   ok((await A.call("write_doc", { path: "/team/requirements.md", content: "x" })).error, "agent cannot write /team docs");
   ok(!(await A.call("write_doc", { path: "/generated/notes.md", content: "ok" })).error, "agent can write /generated docs");
+
+  console.log("Phase 1b: PDF docs");
+  const pdf = makePdf(["Architecture: React SPA talks to an Express REST API.", "Database: Postgres with a reservations table."]);
+  const up = await alice("PUT", `${R}/doc/file?path=/team/architecture.pdf&name=${encodeURIComponent("Архітектура v1.pdf")}`, pdf);
+  ok(up.status === 200 && up.data.path === "/team/architecture.pdf" && up.data.pages === 1 && up.data.chars > 0, "PDF upload: text extracted");
+  ok((await bob("PUT", `${R}/doc/file?path=/team/fake.pdf`, Buffer.from("hello, this is not a pdf"))).status === 400, "non-PDF upload rejected");
+  ok((await bob("PUT", `${R}/doc`, { path: "/team/new.pdf", content: "x" })).status === 400, "a .pdf doc can only be created by uploading a PDF");
+  ok((await eve("GET", `${R}/doc/file?path=/team/architecture.pdf`)).status === 404, "eve (not a member) cannot download the PDF");
+  const pdoc = (await bob("GET", `${R}/doc?path=/team/architecture.pdf`)).data;
+  ok(pdoc.content.includes("## Page 1") && pdoc.content.includes("Express REST API") && pdoc.file?.name === "Архітектура v1.pdf" && pdoc.file.pages === 1,
+    "PDF doc: extracted text + original file info");
+  const served = await bob("GET", `${R}/doc/file?path=/team/architecture.pdf`);
+  ok(served.status === 200 && served.headers.get("content-type") === "application/pdf" && served.buf.equals(pdf) && served.headers.get("x-frame-options") === "SAMEORIGIN",
+    "original PDF served to members (embeddable only by the app)");
+  ok((await bob("PUT", `${R}/doc`, { path: "/team/architecture.pdf", content: `${pdoc.content}\nAuth: JWT in an httpOnly cookie.`, baseVersion: 1 })).data.version === 2,
+    "extracted text can be corrected by hand (v2)");
+  ok((await bob("GET", `${R}/doc?path=/team/architecture.pdf`)).data.file?.version === 1, "a text edit keeps the original PDF");
+  ok((await A.call("list_docs")).text.includes("/team/architecture.pdf") && (await A.call("list_docs")).text.includes("(PDF, 1 pages)"), "list_docs marks PDFs");
+  const rd = await A.call("read_doc", { path: "/team/architecture.pdf" });
+  const link = /(http\S+\/api\/files\/\S+)/.exec(rd.text)?.[1];
+  ok(rd.text.includes("Express REST API") && rd.text.includes("httpOnly cookie") && !!link, "agent reads the PDF's text and gets a download link");
+  const dl = await fetch(link!);
+  ok(dl.status === 200 && Buffer.from(await dl.arrayBuffer()).equals(pdf), "signed link downloads the original PDF without a session");
+  ok((await fetch(link!.replace(/.$/, (c) => (c === "A" ? "B" : "A")))).status === 404, "tampered link rejected");
+  ctx = await A.call("get_context");
+  ok(ctx.text.includes("/team/architecture.pdf") && ctx.text.includes("Express REST API"), "get_context delta includes the uploaded PDF");
+  const up2 = await alice("PUT", `${R}/doc/file?path=/team/architecture.pdf&name=arch-v2.pdf`, makePdf(["Version two: GraphQL instead of REST."]));
+  const pdoc3 = (await alice("GET", `${R}/doc?path=/team/architecture.pdf`)).data;
+  ok(up2.data.version === 3 && pdoc3.file.version === 3 && pdoc3.file.name === "arch-v2.pdf" && pdoc3.content.includes("GraphQL"), "re-upload = new version with the new file");
+  ok((await alice("GET", `${R}/doc/file?path=/team/architecture.pdf&v=2`)).buf.equals(pdf), "older versions keep their PDF");
+  await A.call("write_doc", { path: "/generated/big.md", content: "x".repeat(100000) });
+  const big1 = await A.call("read_doc", { path: "/generated/big.md" }), big3 = await A.call("read_doc", { path: "/generated/big.md", offset: 80000 });
+  ok(big1.text.includes("offset=40000") && big1.text.length < 41000 && !big3.text.includes("call read_doc with offset"), "read_doc returns long docs in chunks");
+  ok((await alice("DELETE", `${R}/doc?path=/team/architecture.pdf`)).status === 200 && (await fetch(link!)).status === 404, "deleting the doc removes its PDFs");
 
   console.log("Phase 2: planning");
   ok((await alice("POST", `${R}/phase/start-planning`)).status === 400, "cannot start planning without lead");

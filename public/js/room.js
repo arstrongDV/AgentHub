@@ -1,4 +1,4 @@
-import { html, useState, useEffect, useRef, api, toast, tryToast, Modal, Link, navigate, useData, ago, time, activity, copy, Code,
+import { html, useState, useEffect, useRef, api, apiUpload, fileSlug, toast, tryToast, Modal, Link, navigate, useData, ago, time, activity, copy, Code,
   Markdown, lineDiff, AGENT_TYPES, PHASES, STATUS, KINDS } from "./lib.js";
 import { AgentSetup, AgentEdit, CreateAgent } from "./agents.js";
 
@@ -58,36 +58,61 @@ export function Room({ id, tab, user, onLogout }) {
 }
 
 // ====================== SIDEBAR: knowledge base ======================
+const PDF_MAX = 20 * 1024 * 1024;
+const isPdf = (file) => file.type === "application/pdf" || /\.pdf$/i.test(file.name);
+// PDF → original stored + text extracted for agents; text files → the doc content itself.
+async function uploadPdf(id, path, file) {
+  if (file.size > PDF_MAX) throw new Error("PDF більший за 20 МБ");
+  const r = await apiUpload(`/api/rooms/${id}/doc/file?path=${encodeURIComponent(path)}&name=${encodeURIComponent(file.name)}`, file);
+  toast(r.chars ? `Завантажено ${r.path} · ${r.pages} стор. · агенти вже бачать текст` : `${r.path}: у PDF немає тексту (скан?), агенти його не прочитають`);
+  return r;
+}
+
 function Sidebar({ id, tick, m, active }) {
   const docs = useData(`/api/rooms/${id}/docs`, [tick]);
   const [creating, setCreating] = useState(null);
+  const [drag, setDrag] = useState(false);
   const fileInput = useRef();
   const list = docs.data || [];
   const group = (prefix) => list.filter((d) => d.path.startsWith(prefix));
   const open = (p) => navigate(`/r/${id}/doc?path=${encodeURIComponent(p)}`);
-  const item = (d, sub) => html`<div class=${`file ${sub ? "sub" : ""} ${active === d.path ? "on" : ""}`} onClick=${() => open(d.path)} title=${d.path}>
-    <span>📄</span><span class="p">${d.path.split("/").pop()}</span><span class="v">v${d.version}</span></div>`;
-  const upload = async (e) => {
-    for (const file of e.target.files) {
-      const text = await file.text();
-      const name = file.name.replace(/[^\w.-]+/g, "-");
-      try { await api(`/api/rooms/${id}/doc`, { method: "PUT", body: { path: `/team/${name}`, content: text } }); toast(`Завантажено /team/${name}`); }
-      catch (err) { toast(err.message); }
+  // Keyed by path+version and marked "notranslate" (file names, versions): Chrome's page translation swaps text nodes,
+  // and Preact would otherwise patch the detached originals, leaving stale names in the list.
+  const item = (d, sub) => html`<div key=${`${d.path}:${d.version}`} class=${`file notranslate ${sub ? "sub" : ""} ${active === d.path ? "on" : ""}`} onClick=${() => open(d.path)}
+    title=${d.pdf_pages != null ? `${d.path} · PDF, ${d.pdf_pages} стор.` : d.path}>
+    <span>${d.pdf_pages != null ? "📕" : "📄"}</span><span class="p">${d.path.split("/").pop()}</span><span class="v">v${d.version}</span></div>`;
+  const upload = async (files) => {
+    let last = null;
+    for (const file of files) {
+      const name = fileSlug(file.name);
+      try {
+        if (isPdf(file)) last = (await uploadPdf(id, `/team/${name.replace(/\.[^.]*$/, "")}.pdf`, file)).path;
+        else {
+          const r = await api(`/api/rooms/${id}/doc`, { method: "PUT", body: { path: `/team/${name}`, content: await file.text() } });
+          toast(`Завантажено ${r.path}`); last = r.path;
+        }
+      } catch (err) { toast(`${file.name}: ${err.message}`); }
     }
-    e.target.value = "";
+    if (files.length === 1 && last) open(last);
   };
+  const hasFiles = (e) => [...(e.dataTransfer?.types || [])].includes("Files");
   const agentNames = [...new Set(group("/agents/").map((d) => d.path.split("/")[2]))];
-  return html`<div class="sidebar">
+  return html`<div class=${`sidebar ${drag ? "drop" : ""}`}
+    onDragOver=${(e) => { if (hasFiles(e)) { e.preventDefault(); setDrag(true); } }}
+    onDragLeave=${(e) => { if (!e.currentTarget.contains(e.relatedTarget)) setDrag(false); }}
+    onDrop=${(e) => { if (!hasFiles(e)) return; e.preventDefault(); setDrag(false); upload([...e.dataTransfer.files]); }}>
     <div class="sb-h">Команда<span class="spacer"></span>
-      <button class="ghost sm" title="Завантажити .md файли" onClick=${() => fileInput.current.click()}>⇪</button>
+      <button class="ghost sm" title="Завантажити файли: PDF, .md, .txt (або перетягни їх сюди)" onClick=${() => fileInput.current.click()}>⇪</button>
       <button class="ghost sm" title="Новий документ" onClick=${() => setCreating("/team/")}>＋</button></div>
-    <input type="file" accept=".md,.txt,.json,.yml,.yaml" multiple style="display:none" ref=${fileInput} onChange=${upload} />
-    <div class="sb-hint">Вимоги, архітектура, правила роботи. Редагують люди, агенти читають.</div>
+    <input type="file" accept=".pdf,.md,.txt,.json,.yml,.yaml" multiple style="display:none" ref=${fileInput}
+      onChange=${(e) => { const files = [...e.target.files]; e.target.value = ""; upload(files); }} />
+    <div class="sb-hint">Вимоги, архітектура, правила роботи: PDF або .md (можна перетягнути сюди). Редагують люди, агенти читають.</div>
+    ${drag && html`<div class="sb-drop">Відпусти, щоб додати в /team/</div>`}
     ${group("/team/").filter((d) => !d.path.startsWith("/team/subagents/")).map((d) => item(d))}
     ${group("/team/subagents/").length > 0 && html`<div class="file dim small" style="cursor:default">субагенти</div>${group("/team/subagents/").map((d) => item(d, true))}`}
     <div class="sb-h">Агенти</div>
     <div class="sb-hint">Профіль кожного агента — пише його власник.</div>
-    ${agentNames.map((n) => group(`/agents/${n}/`).map((d) => html`<div class=${`file ${active === d.path ? "on" : ""}`} onClick=${() => open(d.path)}>
+    ${agentNames.map((n) => group(`/agents/${n}/`).map((d) => html`<div key=${`${d.path}:${d.version}`} class=${`file notranslate ${active === d.path ? "on" : ""}`} onClick=${() => open(d.path)}>
       <span>🤖</span><span class="p">${n}${d.path.endsWith("/profile.md") ? "" : " / " + d.path.split("/").pop()}</span><span class="v">v${d.version}</span></div>`))}
     ${!agentNames.length && html`<div class="sb-hint">Ще немає агентів.</div>`}
     <div class="sb-h">Згенеровано агентами<span class="spacer"></span><button class="ghost sm" onClick=${() => setCreating("/generated/")}>＋</button></div>
@@ -110,16 +135,23 @@ function NewDoc({ id, prefix, onClose, onDone }) {
 }
 
 // ====================== DOC VIEW / EDITOR ======================
+const mb = (n) => (n >= 1048576 ? `${(n / 1048576).toFixed(1)} МБ` : `${Math.max(1, Math.round(n / 1024))} КБ`);
+
 function DocView({ id, path, tick, m }) {
   const doc = useData(`/api/rooms/${id}/doc?path=${encodeURIComponent(path)}`, [tick]);
   const versions = useData(`/api/rooms/${id}/doc/versions?path=${encodeURIComponent(path)}`, [tick]);
   const [mode, setMode] = useState("view");
+  const [view, setView] = useState("file"); // PDFs: "file" (the PDF itself) or "text" (what agents read)
   const [draft, setDraft] = useState(null);
   const [base, setBase] = useState(null);
   const [diff, setDiff] = useState(null);
+  const replaceInput = useRef();
   if (doc.error) return html`<div class="empty">${doc.error}</div>`;
   if (!doc.data) return html`<div class="muted">…</div>`;
   const d = doc.data;
+  const f = d.file;
+  const fileUrl = f && `/api/rooms/${id}/doc/file?path=${encodeURIComponent(path)}&v=${f.version}`;
+  const showText = !f || view === "text" || mode === "edit" || !!diff;
   const agentMatch = /^\/agents\/([^/]+)\//.exec(path);
   const ownerAgent = agentMatch && m.agents.find((a) => a.name.toLowerCase() === agentMatch[1].toLowerCase());
   const canEdit = path.startsWith("/team/") || path.startsWith("/generated/") || (ownerAgent ? ownerAgent.mine || m.me.role === "owner" : m.me.role === "owner");
@@ -134,23 +166,41 @@ function DocView({ id, path, tick, m }) {
     setDiff({ v, lines: lineDiff(prev.content, d.content) });
   });
   const del = tryToast(async () => { if (!confirm(`Видалити ${path}?`)) return; await api(`/api/rooms/${id}/doc?path=${encodeURIComponent(path)}`, { method: "DELETE" }); navigate(`/r/${id}/overview`); });
-  const area = path.startsWith("/team/") ? "Спільний документ команди — агенти читають його через get_context."
+  const replace = async (e) => {
+    const file = e.target.files[0]; e.target.value = "";
+    if (!file) return;
+    if (!isPdf(file)) return toast("Обери PDF-файл");
+    try { await uploadPdf(id, path, file); setView("file"); } catch (err) { toast(err.message); }
+  };
+  const area = f ? `PDF «${f.name}» · ${f.pages} стор. · ${mb(f.size)} · завантажив ${f.uploaded_by}. Агенти читають текст, витягнутий із PDF (вкладка «Текст для агентів»), а картинки й діаграми можуть подивитися, завантаживши оригінал.`
+    : path.startsWith("/team/") ? "Спільний документ команди — агенти читають його через get_context."
     : path.startsWith("/agents/") ? `Профіль агента. Редагує лише власник агента${ownerAgent ? ` (${ownerAgent.owner})` : ""}.`
     : "Документ, який ведуть агенти (вони теж можуть його змінювати).";
-  return html`<div>
-    <div class="doc-h"><h2>${path}</h2><span class="badge">v${d.version}</span><span class="muted small">${d.updated_by} · ${ago(d.updated_at)}</span><span class="spacer"></span>
+  const noText = f && f.text_chars === 0 && f.version === d.version;
+  return html`<div key=${d.version}>
+    <div class="doc-h"><h2 class="notranslate">${path}</h2><span class="badge notranslate">v${d.version}</span><span class="muted small">${d.updated_by} · ${ago(d.updated_at)}</span><span class="spacer"></span>
       ${mode === "view" && html`
+        ${f && html`<div class="seg">
+          <button key="seg-file" class=${!showText ? "on" : ""} onClick=${() => { setDiff(null); setView("file"); }}>PDF</button>
+          <button key="seg-text" class=${showText ? "on" : ""} onClick=${() => setView("text")}>Текст для агентів</button></div>`}
         <select style="width:auto" onChange=${(e) => showDiff(Number(e.target.value))}><option value="">Порівняти з версією…</option>
           ${(versions.data || []).filter((v) => v.version !== d.version).map((v) => html`<option value=${v.version}>v${v.version} · ${v.updated_by} · ${ago(v.created_at)}</option>`)}</select>
-        ${canEdit && html`<button class="primary" onClick=${edit}>Редагувати</button>`}
+        ${f && html`<button title="Завантажити PDF" onClick=${() => { location.href = `${fileUrl}&download=1`; }}>⇩ PDF</button>`}
+        ${f && canEdit && html`<button title="Завантажити нову версію PDF (історія зберігається)" onClick=${() => replaceInput.current.click()}>Замінити PDF</button>
+          <input type="file" accept=".pdf,application/pdf" style="display:none" ref=${replaceInput} onChange=${replace} />`}
+        ${canEdit && showText && html`<button class="primary" onClick=${edit}>${f ? "Редагувати текст" : "Редагувати"}</button>`}
         ${canEdit && path !== "/team/workflow.md" && html`<button class="ghost danger" onClick=${del}>Видалити</button>`}`}
       ${mode === "edit" && html`<button onClick=${() => setMode("view")}>Скасувати</button><button class="primary" onClick=${save}>Зберегти</button>`}
     </div>
     <p class="muted small" style="margin-top:-4px">${area}${!canEdit ? " Тобі доступний лише перегляд." : ""}</p>
+    ${noText && html`<div class="callout warn">У цьому PDF немає текстового шару (скан або картинки), тож агенти бачать лише посилання на файл.
+      Допиши головне текстом: «Текст для агентів» → «Редагувати текст».</div>`}
+    ${f && !showText && html`<iframe key=${fileUrl} class="pdf-frame" src=${fileUrl} title=${f.name}></iframe>
+      <div class="small muted" style="margin-top:6px">Не відображається? <a href=${fileUrl} target="_blank" rel="noopener">Відкрити PDF у новій вкладці</a></div>`}
     ${mode === "edit" && html`<textarea class="editor" value=${draft} onInput=${(e) => setDraft(e.target.value)} onKeyDown=${(e) => { if ((e.metaKey || e.ctrlKey) && e.key === "s") { e.preventDefault(); save(); } }}></textarea>`}
     ${mode === "view" && diff && html`<div class="row" style="margin-bottom:8px"><b>Зміни v${diff.v} → v${d.version}</b><button class="ghost sm" onClick=${() => setDiff(null)}>✕</button></div>
       <div class="diff">${diff.lines.map((l) => html`<div class=${l.t}>${l.t === "add" ? "+ " : l.t === "del" ? "− " : "  "}${l.s}</div>`)}</div>`}
-    ${mode === "view" && !diff && html`<div class="card"><${Markdown} text=${d.content} /></div>`}
+    ${mode === "view" && !diff && showText && html`<div class="card"><${Markdown} text=${d.content} /></div>`}
   </div>`;
 }
 

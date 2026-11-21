@@ -251,6 +251,23 @@ const MIGRATIONS: string[] = [
     created_at TEXT NOT NULL
   );
   `,
+  // 2: original files (PDF) behind docs. The doc's content is the text extracted for agents;
+  // `version` is the doc version the file was uploaded with (a text-only edit keeps the same file).
+  `
+  CREATE TABLE doc_files (
+    doc_id INTEGER NOT NULL REFERENCES docs(id) ON DELETE CASCADE,
+    version INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    mime TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    pages INTEGER NOT NULL DEFAULT 0,
+    text_chars INTEGER NOT NULL DEFAULT 0,
+    data BLOB NOT NULL,
+    uploaded_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (doc_id, version)
+  );
+  `,
 ];
 
 export function migrate() {

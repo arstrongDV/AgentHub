@@ -420,7 +420,7 @@ export function normDocPath(p: string) {
   s = s.replace(/\/{2,}/g, "/");
   if (s.split("/").some((seg) => seg === ".." || seg === ".")) fail("invalid path");
   if (!/^\/(team|agents|generated)\/[\w\-./]+$/.test(s)) fail("path must start with /team/, /agents/<name>/ or /generated/ and use letters, digits, - _ . /");
-  if (!/\.(md|txt|json|ya?ml)$/.test(s)) s += ".md";
+  if (!/\.(md|txt|json|ya?ml|pdf)$/.test(s)) s += ".md";
   return s.slice(0, 200);
 }
 
@@ -455,7 +455,11 @@ export function canEditDoc(roomId: string, path: string, actor: Actor, memberRol
 }
 
 export const listDocs = (roomId: string) =>
-  db.prepare("SELECT id, path, version, updated_by, updated_at, length(content) AS size FROM docs WHERE room_id = ? ORDER BY path").all(roomId) as any[];
+  db.prepare(
+    `SELECT d.id, d.path, d.version, d.updated_by, d.updated_at, length(d.content) AS size,
+       (SELECT f.pages FROM doc_files f WHERE f.doc_id = d.id ORDER BY f.version DESC LIMIT 1) AS pdf_pages
+     FROM docs d WHERE d.room_id = ? ORDER BY d.path`
+  ).all(roomId) as any[];
 export const getDoc = (roomId: string, path: string) =>
   db.prepare("SELECT * FROM docs WHERE room_id = ? AND path = ?").get(roomId, path) as Doc | undefined;
 
@@ -469,6 +473,7 @@ export function writeDoc(roomId: string, path: string, content: string, actor: A
   content = String(content ?? "");
   if (content.length > 300000) fail("document too large (max 300k chars)");
   const existing = getDoc(roomId, path);
+  if (!existing && path.endsWith(".pdf")) fail("a .pdf document is created by uploading a PDF file (⇪ in the Team sidebar)");
   if (existing && opts.baseVersion && opts.baseVersion !== existing.version)
     fail(`conflict: ${path} was changed by ${existing.updated_by} (now v${existing.version}, you edited v${opts.baseVersion}). Reload and merge.`, 409);
   const next = opts.mode === "append" && existing ? `${existing.content.replace(/\s+$/, "")}\n\n${content}` : content;

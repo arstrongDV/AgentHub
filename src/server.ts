@@ -4,11 +4,12 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import "./db.js";
-import { loadUser, authRoutes, GITHUB_ENABLED } from "./auth.js";
+import { loadUser, authRoutes, GITHUB_ENABLED, publicUrl } from "./auth.js";
 import { apiRoutes } from "./api.js";
 import * as C from "./core.js";
 import { handleWebhook, startPrSync } from "./github.js";
 import { buildMcpServer } from "./mcp.js";
+import { sendSignedFile } from "./files.js";
 import { pointerFile, cursorPointer } from "./templates.js";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -44,7 +45,7 @@ app.post("/mcp/:token", async (req, res) => {
   const agent = agentFromToken(req.params.token);
   if (!agent) return res.status(401).json({ jsonrpc: "2.0", error: { code: -32001, message: "Invalid or revoked room token" }, id: null });
   try {
-    const server = buildMcpServer(agent);
+    const server = buildMcpServer(agent, publicUrl(req));
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
     res.on("close", () => { transport.close(); server.close(); });
     await server.connect(transport);
@@ -110,6 +111,9 @@ app.get("/api/agent/:token/events", (req, res) => {
   };
   req.on("close", cleanup); res.on("close", cleanup);
 });
+
+// Original PDFs for agents: a short-lived signed link from read_doc (agents have no browser session).
+app.get("/api/files/:sig", (req, res) => sendSignedFile(res, req.params.sig));
 
 // Agent endpoints above are token-authenticated; the session-authenticated API comes after them.
 authRoutes(app);
